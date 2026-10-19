@@ -1,4 +1,4 @@
-# Google Forms Anti-Cheating Monitor
+# FormSentry
 
 A Chrome / Microsoft Edge extension (Manifest V3) that adds a **monitoring and restriction layer** around existing Google Forms exams.
 

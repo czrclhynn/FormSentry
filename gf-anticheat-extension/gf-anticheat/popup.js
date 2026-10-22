@@ -1,31 +1,11 @@
-const send = m => new Promise((resolve, reject) => chrome.runtime.sendMessage(m, response => {
-  if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message)); else resolve(response);
-}));
-const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const o = document.getElementById('o'), end = document.getElementById('end');
-function showError(message) {
-  o.className = 'status-card error';
-  o.innerHTML = `<p class="status-title"><span class="status-dot"></span>Monitoring status unavailable</p><p class="muted">${esc(message)}</p>`;
-}
-document.getElementById('opt').onclick = () => chrome.runtime.openOptionsPage();
-end.onclick = async () => {
-  end.disabled = true;
-  try { await send({ kind: 'END', reason: 'ended from popup' }); location.reload(); }
-  catch { showError('Unable to end monitoring. Please try again.'); end.disabled = false; }
-};
-(async () => {
-  try {
-    const s = await send({ kind: 'SUMMARY' });
-    if (!s || !s.cfg) throw new Error('Missing summary');
-    const on = s.session && s.session.active, ex = on && s.cfg.exams.find(e => e.id === s.session.examId);
-    end.disabled = !on;
-    if (on && !ex) { showError('The active exam is no longer in Teacher Settings. You can end this session below.'); return; }
-    if (!on) o.innerHTML = '<p class="status-title"><span class="status-dot"></span>Not monitoring</p><p class="muted">Monitoring is active only during an approved exam.</p>';
-    else {
-      const r = ex.rules, t = v => (v === 'OFF' || v === 'ALLOW' ? 'Off' : 'On');
-      o.classList.add('active');
-      o.innerHTML = `<p class="status-title"><span class="status-dot"></span>Monitoring active</p><p class="exam-title">${esc(ex.name)}</p><p class="connection">Google Form: Connected</p>
-        <dl class="session-rules">${[['Tab switching', t(r.tabSwitch)], ['Blocked websites', 'On'], ['Copy/paste', t(r.copyPaste)], ['Fullscreen', r.fullscreen === 'REQUIRED' ? 'Required' : 'Optional'], ['AI websites', t(r.ai)], ['Events', s.monitoring]].map(([label, value]) => `<div><dt>${label}</dt><dd>${esc(value)}</dd></div>`).join('')}</dl><p class="muted">Monitoring is active only during this examination.</p>`;
-    }
-  } catch { showError('Could not connect to the monitor. Close and reopen this popup to try again.'); }
-})();
+'use strict';
+const S=FormSentry,U=FormSentryUI,$=id=>document.getElementById(id);let latest;
+async function refresh(){try{latest=await U.send({kind:'SUMMARY'});const s=latest.session,on=!!s?.active;$('end').disabled=!on;$('return').hidden=!on;$('status').className='status-card'+(on?' active':'');
+  $('status').innerHTML=`<p class="status-title"><span class="status-dot"></span>${on?'Monitoring':S.esc(S.label(s?.status||'NOT_STARTED'))}</p>${s?`<p class="exam-title">${S.esc(s.exam?.name||'Examination')}</p><p class="muted">${S.esc(s.student?.name||'Legacy session')}${s.student?.email?' · '+S.esc(s.student.email):''}</p><p class="helper">Student-entered identity · ${S.esc(s.id)}</p><p class="muted">${on?'Browser observations are recorded for teacher review.':'No monitoring is active.'}</p><p class="muted">Submission: ${S.esc(S.label(s.cloud?.submission||'not_detected'))}. Google Forms receipt is not independently verified.</p><p class="muted">${s.cloud?.syncError?S.esc(s.cloud.syncError):s.cloud?.lastSyncAt?'Last upload: '+S.esc(new Date(s.cloud.lastSyncAt).toLocaleTimeString()):'Activity uploads after the next successful sync.'}</p>`:'<p class="muted">Open the examination invitation from your teacher. Enter your name and email, review the guidelines, and consent before selecting Start Examination.</p>'}`;
+  $('local-export').disabled=!s;
+}catch(error){$('status').className='status-card error';$('status').textContent='Monitoring status unavailable. Check that FormSentry is enabled, then refresh.';$('feedback').textContent=error.message;}}
+$('settings').onclick=()=>chrome.runtime.openOptionsPage();$('retry').onclick=()=>U.action($('retry'),$('feedback'),refresh);$('return').onclick=()=>U.action($('return'),$('feedback'),()=>U.send({kind:'RETURN_TO_EXAM'}));
+$('end').onclick=()=>{if(confirm('Finish monitoring? Submit your Google Form separately first. Submission remains unverified by FormSentry.'))U.action($('end'),$('feedback'),async()=>{await U.send({kind:'END'});await refresh();}).then(refresh);};
+const exportButton=document.createElement('button');exportButton.id='local-export';exportButton.className='button secondary full-width spaced';exportButton.textContent='Export this session’s local records';document.querySelector('main').appendChild(exportButton);
+exportButton.onclick=()=>{const s=latest?.session;if(!s)return;U.download('formsentry-local-session-'+s.id+'.json',JSON.stringify({notice:'Local client records; not independently verified. May include records not accepted by the server.',student:s.student,sessionId:s.id,events:latest.events.filter(e=>e.sessionId===s.id)},null,2),'application/json');};
+chrome.storage.onChanged.addListener((changes,area)=>{if(area==='local'&&changes.session)refresh();});refresh();

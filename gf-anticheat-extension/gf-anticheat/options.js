@@ -1,80 +1,61 @@
-const $ = id => document.getElementById(id), esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const OPTS = { tabSwitch:['OFF','MONITOR','BLOCK'], newTab:['ALLOW','MONITOR','BLOCK'], ai:['ALLOW','MONITOR','BLOCK'], copyPaste:['ALLOW','MONITOR','BLOCK'],
-  fullscreen:['OPTIONAL','REQUIRED'], devtools:['MONITOR','RESTRICT'], contextMenu:['ALLOW','MONITOR','BLOCK'] };
-const DEF = { tabSwitch:'MONITOR', newTab:'BLOCK', ai:'BLOCK', copyPaste:'BLOCK', fullscreen:'REQUIRED', devtools:'RESTRICT', contextMenu:'BLOCK' };
-const DOMS = `chatgpt.com,AI\nchat.openai.com,AI\nclaude.ai,AI\ngemini.google.com,AI\ncopilot.microsoft.com,AI\nperplexity.ai,AI\ngoogle.com,SEARCH,MONITORED\nbing.com,SEARCH,MONITORED\nduckduckgo.com,SEARCH,MONITORED\nmessenger.com,COMM,BLOCKED\ndiscord.com,COMM,BLOCKED\nweb.whatsapp.com,COMM,BLOCKED\nfacebook.com,COMM,MONITORED`;
-let cfg;
-const load = async () => { cfg = (await chrome.storage.local.get('config')).config || { exams: [], domains: DOMS, endpoint: '' }; };
-const save = () => chrome.storage.local.set({ config: cfg });
-const LABELS = { tabSwitch:'Tab switching', newTab:'New tabs', ai:'AI websites', copyPaste:'Copy/paste', fullscreen:'Fullscreen', devtools:'Developer tools', contextMenu:'Context menu' };
-const VALUES = { OFF:'Off', ALLOW:'Allow', MONITOR:'Monitor', BLOCK:'Block', OPTIONAL:'Optional', REQUIRED:'Required', RESTRICT:'Restrict', DETECTION:'Detection', RESTRICTION:'Restriction' };
-const options = (values, selected) => values.map(v => `<option value="${v}" ${v === selected ? 'selected' : ''}>${VALUES[v]}</option>`).join('');
-const modeNote = mode => mode === 'DETECTION' ? 'Detection mode records activity. Block and Restrict rules are monitored without enforcement.' : 'Restriction mode enforces the configured Block and Restrict rules.';
-function render() {
-  $('dom').value = cfg.domains; $('ep').value = cfg.endpoint || '';
-  $('exam-count').textContent = `${cfg.exams.length} ${cfg.exams.length === 1 ? 'exam' : 'exams'}`;
-  $('exams').innerHTML = cfg.exams.map((e, i) => {
-    const safeURL = /^https:\/\/docs\.google\.com\/forms\//.test(e.url);
-    return `<article class="exam-card" aria-labelledby="exam-${i}"><div class="exam-header"><div class="exam-info"><h3 id="exam-${i}">${esc(e.name)}</h3>${safeURL ? `<a class="exam-url" href="${esc(e.url)}" target="_blank" rel="noopener noreferrer" title="${esc(e.url)} (opens in a new tab)"><span>${esc(e.url)}</span><b aria-hidden="true">↗</b></a>` : `<span class="exam-url">${esc(e.url)}</span>`}</div><button class="button danger-outline" data-del="${i}" aria-label="Remove ${esc(e.name)}">Remove</button></div>
-    <div class="settings-grid"><div class="field"><label for="mode-${i}">Mode</label><select id="mode-${i}" data-i="${i}" data-k="mode" aria-describedby="mode-note-${i}">${options(['DETECTION','RESTRICTION'], e.mode)}</select></div>
-    ${Object.entries(OPTS).map(([k, v]) => `<div class="field"><label for="rule-${i}-${k}">${LABELS[k]}</label><select id="rule-${i}-${k}" data-i="${i}" data-r="${k}">${options(v, e.rules[k])}</select></div>`).join('')}</div><p id="mode-note-${i}" class="mode-note">${modeNote(e.mode)} Changes save automatically.</p></article>`;
-  }).join('') || '<div class="empty-state"><strong>No approved exams yet</strong>Add a Google Form below to configure your first exam.</div>';
-  const sims = ['TAB_SWITCH','AI_WEBSITE_DETECTED','BLOCKED_WEBSITE_DETECTED','FULLSCREEN_EXIT','COPY_ATTEMPT','PASTE_ATTEMPT','DEVTOOLS_ATTEMPT','EXTENSION_DISCONNECTED','PDF_OPENED','DESKTOP_APPLICATION_OPENED'];
-  $('sims').innerHTML = sims.map(t => `<button class="button secondary" data-sim="${t}" title="Simulate ${t}">Simulate ${t.toLowerCase().replaceAll('_', ' ')}</button>`).join('');
+'use strict';
+const A=FormSentryTeacher,U=FormSentryUI,S=FormSentry,$=id=>document.getElementById(id),esc=S.esc;
+let account,exams=[],sessions=[],events=[],selected=null,detailEvents=[],polling=false,authEpoch=0,detailRequest=0;
+const safeColumns='id,exam_id,student_name,student_email,student_reference,started_at,ended_at,status,submission_status,last_activity_at,last_sync_at';
+const feedback=(id,error)=>{$(id).textContent=error.message||error;$(id).classList.add('error-text');};
+const title=id=>exams.find(e=>e.id===id)?.title||'Examination';
+const when=value=>value?new Date(value).toLocaleString():'—';
+const status=value=>S.label(value);
+const route=(table,query)=>table+'?'+query;
+async function exact(table,filter){const r=await A.rest(route(table,'select=id&limit=1&'+filter),{headers:{Prefer:'count=exact'},count:true});return r.count;}
+function lock(){authEpoch++;detailRequest++;account=null;exams=[];sessions=[];events=[];detailEvents=[];selected=null;$('workspace').hidden=true;$('logout').hidden=true;$('auth').hidden=false;$('session-detail').hidden=true;for(const id of ['exams','sessions','events','timeline','stats'])$(id).replaceChildren();}
+async function unlock(){account=await A.user();$('auth').hidden=true;$('workspace').hidden=false;$('logout').hidden=false;$('welcome').textContent=account.email;await refresh();}
+function examRows(){
+  $('exams').innerHTML=exams.map(e=>`<article class="exam-line"><div><h3>${esc(e.title)}</h3><p class="helper">${esc(status(e.status))} · ${e.rules.mode==='WARN'?'Reminders enabled':'Record only'}</p><p class="helper url-text">${esc(e.form_url)}</p></div><div class="actions"><button class="button secondary" data-copy="${e.id}">Copy invitation</button><button class="button secondary" data-edit="${e.id}">Edit</button><button class="button secondary" data-exam="${e.id}">Sessions</button><button class="button danger-outline" data-remove="${e.id}">Remove</button></div></article>`).join('')||'<div class="empty-state"><strong>No examinations yet</strong>Create an examination, set its rules, then share its invitation.</div>';
+  const current=$('exam-filter').value;$('exam-filter').innerHTML='<option value="">All examinations</option>'+exams.map(e=>`<option value="${e.id}">${esc(e.title)}</option>`).join('');$('exam-filter').value=current;
 }
-async function log() {
-  try {
-    const { events = [] } = await chrome.storage.local.get('events');
-    const s = await new Promise(r => chrome.runtime.sendMessage({ kind: 'SUMMARY' }, r));
-    if (!s) throw new Error('Summary unavailable');
-    $('sum').innerHTML = [['Monitoring Events',s.monitoring],['Potential Violations',s.violations],['Score',s.score]].map(([label, value]) => `<div class="stat"><span class="stat-label">${label}</span><strong class="stat-value">${esc(value)}</strong></div>`).join('');
-    $('log').innerHTML = '<thead><tr><th scope="col">Time</th><th scope="col">Event type</th><th scope="col">Severity</th><th scope="col">Domain</th><th scope="col">Details</th></tr></thead><tbody>' + (events.slice(-200).reverse().map(e => {
-      const metadata = e.metadata || {}, simulated = metadata.SIMULATED_EVENT, date = new Date(e.timestamp);
-      const severity = ['LOW','MEDIUM','HIGH'].includes(e.severity) ? e.severity.toLowerCase() : '';
-      const time = Number.isNaN(date.getTime()) ? esc(e.timestamp) : `<time datetime="${esc(e.timestamp)}" title="${esc(e.timestamp)}">${esc(date.toLocaleTimeString())}<small>${esc(date.toLocaleDateString())}</small></time>`;
-      return `<tr class="${simulated ? 'sim' : ''}"><td>${time}</td><td><span class="badge event-type">${esc(e.type)}</span>${simulated ? '<span class="sim-label">SIMULATED EVENT</span>' : ''}</td><td><span class="badge severity-${severity}">${esc(e.severity)}</span></td><td class="domain-cell">${esc(e.domain || '—')}</td><td><details class="event-details"><summary title="Expand event details">${esc(JSON.stringify(metadata))}</summary><pre>${esc(JSON.stringify(metadata, null, 2))}</pre></details></td></tr>`;
-    }).join('') || '<tr><td colspan="5"><div class="empty-state"><strong>No events recorded</strong>Activity from monitored exams will appear here.</div></td></tr>') + '</tbody>';
-    $('log-feedback').textContent = '';
-  } catch { $('log-feedback').textContent = 'Unable to load events. Select Refresh to try again.'; }
+function sessionRows(){const query=$('student-search').value.toLowerCase(),exam=$('exam-filter').value;
+  const list=sessions.filter(s=>(!exam||s.exam_id===exam)&&(!query||(s.student_name+' '+s.student_email).toLowerCase().includes(query)));
+  $('sessions').innerHTML='<thead><tr><th>Student</th><th>Email</th><th>Examination</th><th>Status</th><th>Submission</th><th>Last sync</th></tr></thead><tbody>'+(list.map(s=>`<tr><td><button class="text-button" data-session="${s.id}">${esc(s.student_name)}</button></td><td>${esc(s.student_email)}</td><td>${esc(title(s.exam_id))}</td><td>${esc(status(s.status))}</td><td>${esc(status(s.submission_status))}</td><td>${esc(when(s.last_sync_at))}</td></tr>`).join('')||'<tr><td colspan="6"><div class="empty-state"><strong>No matching sessions</strong>Students appear after entering their identity, consenting, and starting an active examination.</div></td></tr>')+'</tbody>';
 }
-document.addEventListener('change', async e => {
-  const t = e.target, i = t.dataset.i; if (i == null) return;
-  if (t.dataset.k) cfg.exams[i].mode = t.value; else cfg.exams[i].rules[t.dataset.r] = t.value;
-  try {
-    await save();
-    if (t.dataset.k) $('mode-note-' + i).textContent = modeNote(t.value) + ' Changes save automatically.';
-    $('exam-feedback').textContent = 'Exam settings saved.';
-  } catch { $('exam-feedback').textContent = 'Unable to save exam settings. Please try again.'; }
+function visibleEvents(){return events.filter(e=>!$('category-filter').value||e.category===$('category-filter').value);}
+function eventRows(){
+  $('events').innerHTML='<thead><tr><th>Student</th><th>Examination</th><th>Event</th><th>Timestamp</th><th>Duration</th><th>Category</th></tr></thead><tbody>'+(visibleEvents().map(e=>{const s=e.student_sessions||sessions.find(s=>s.id===e.session_id);return `<tr><td>${esc(s?.student_name||'Session '+e.session_id.slice(0,8))}</td><td>${esc(title(s?.exam_id))}</td><td>${esc(e.description)}</td><td>${esc(when(e.occurred_at))}</td><td>${e.duration_ms==null?'—':Math.round(e.duration_ms/1000)+' s'}</td><td>${esc(S.CATEGORIES[e.category])}</td></tr>`;}).join('')||'<tr><td colspan="6"><div class="empty-state"><strong>No activity yet</strong>Activity appears after the student’s extension synchronizes finalized records.</div></td></tr>')+'</tbody>';
+}
+async function refresh(){
+  if(!account||polling)return;polling=true;const epoch=authEpoch;
+  try{
+    const [x,s,e,active,monitoring,completed,review]=await Promise.all([A.rest('exams?select=*&order=created_at.desc'),A.rest('student_sessions?select='+safeColumns+'&order=started_at.desc&limit=1000'),A.rest('monitoring_events?select=*,student_sessions(student_name,student_email,exam_id)&order=occurred_at.desc&limit=1000'),exact('exams','status=eq.active'),exact('student_sessions','status=eq.active&last_sync_at=gt.'+encodeURIComponent(new Date(Date.now()-90000).toISOString())),exact('student_sessions','status=eq.completed'),exact('monitoring_events','category=eq.REVIEW')]);
+    if(epoch!==authEpoch||!account)return;exams=x;sessions=s;events=e;examRows();sessionRows();eventRows();$('stats').innerHTML=[['Active exams',active],['Currently monitoring',monitoring],['Completed sessions',completed],['Review needed',review]].map(([label,value])=>`<div class="stat"><span class="stat-label">${label}</span><strong class="stat-value">${value}</strong></div>`).join('');$('feedback').textContent='';
+    if(selected&&!$('session-detail').hidden)await openSession(selected.id,false);
+  }catch(error){if(error.status===401)lock();feedback('feedback',error);}finally{polling=false;}
+}
+function editor(exam){$('exam-form').hidden=false;$('exam-form').reset();$('exam-id').value=exam?.id||'';$('editor-title').textContent=exam?'Edit examination':'Create examination';$('exam-title').value=exam?.title||'';$('exam-url').value=exam?.form_url||'';$('exam-status').value=exam?.status||'draft';$('exam-mode').value=exam?.rules.mode||'RECORD';for(const k of ['departures','fullscreen','clipboard'])$('rule-'+k).checked=exam?exam.rules[k]:k!=='fullscreen';$('exam-domains').value=exam?.rules.domains.join('\n')||'';$('exam-title').focus();}
+$('new-exam').onclick=()=>editor();$('exam-cancel').onclick=()=>$('exam-form').hidden=true;
+$('exam-form').onsubmit=e=>{e.preventDefault();U.action($('exam-save'),$('exam-feedback'),async()=>{const domains=[...new Set($('exam-domains').value.split(/\s+/).map(s=>s.trim().toLowerCase().replace(/^www\./,'')).filter(Boolean))];if(domains.length>50)throw new Error('Use at most 50 domains.');S.parseDomains(domains.map(d=>d+',OTHER').join('\n'));const record={title:$('exam-title').value.trim(),form_url:S.examURL($('exam-url').value),status:$('exam-status').value,rules:{departures:$('rule-departures').checked,fullscreen:$('rule-fullscreen').checked,clipboard:$('rule-clipboard').checked,domains,mode:$('exam-mode').value}};const id=$('exam-id').value;await A.rest('exams'+(id?'?id=eq.'+id:''),{method:id?'PATCH':'POST',body:record});$('exam-form').hidden=true;await refresh();});};
+document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;
+  if(b.dataset.edit)editor(exams.find(x=>x.id===b.dataset.edit));
+  if(b.dataset.copy)U.action(b,$('feedback'),async()=>{const exam=exams.find(x=>x.id===b.dataset.copy);if(exam.status!=='active')throw new Error('Activate this examination before sharing it.');await navigator.clipboard.writeText(exam.form_url+'#formsentry='+exam.join_code);$('feedback').textContent='Invitation copied. Share it with the extension setup instructions.';});
+  if(b.dataset.exam){$('exam-filter').value=b.dataset.exam;sessionRows();location.hash='students';}
+  if(b.dataset.remove&&confirm('Remove this examination? Examinations with student records cannot be deleted; deactivate them instead.'))U.action(b,$('feedback'),async()=>{await A.rest('exams?id=eq.'+b.dataset.remove,{method:'DELETE'});await refresh();});
+  if(b.dataset.session)openSession(b.dataset.session).catch(e=>feedback('feedback',e));
 });
-document.addEventListener('click', async e => {
-  const t = e.target.closest('button'); if (!t) return;
-  if (t.dataset.del != null) { cfg.exams.splice(+t.dataset.del, 1); await save(); render(); $('exam-feedback').textContent = 'Exam removed.'; }
-  if (t.dataset.sim) { await new Promise(r => chrome.runtime.sendMessage({ kind: 'SIMULATE', type: t.dataset.sim }, r)); log(); }
-});
-function fieldError(id, message) {
-  $(id).setAttribute('aria-invalid', String(!!message));
-  $(id + '-error').textContent = message; $(id + '-error').hidden = !message;
-}
-for (const id of ['n','u']) $(id).addEventListener('input', () => fieldError(id, ''));
-$('add-form').onsubmit = e => e.preventDefault();
-$('add').onclick = async e => {
-  e.preventDefault();
-  const name = $('n').value.trim(), url = $('u').value.trim();
-  let validURL = false;
-  try { const parsed = new URL(url); validURL = parsed.protocol === 'https:' && parsed.hostname === 'docs.google.com' && parsed.pathname.startsWith('/forms/'); } catch {}
-  fieldError('n', name ? '' : 'Enter an exam name.');
-  fieldError('u', validURL ? '' : 'Enter a valid https://docs.google.com/forms/ URL.');
-  if (!name || !validURL) { $(name ? 'u' : 'n').focus(); return; }
-  cfg.exams.push({ id: 'x' + Date.now(), name, url, mode: 'RESTRICTION', rules: { ...DEF } });
-  await save(); render(); $('exam-feedback').textContent = 'Exam added. Monitoring rules are ready to configure.';
-};
-$('save').onclick = async () => {
-  cfg.domains = $('dom').value; cfg.endpoint = $('ep').value.trim();
-  try { await save(); $('save-feedback').textContent = 'Domains and endpoint saved.'; }
-  catch { $('save-feedback').textContent = 'Unable to save. Please try again.'; }
-};
-$('ref').onclick = log; $('clr').onclick = async () => { await chrome.storage.local.set({ events: [] }); await log(); $('log-feedback').textContent = 'Event log cleared.'; };
-$('exp').onclick = async () => { const { events = [] } = await chrome.storage.local.get('events'); const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([JSON.stringify(events, null, 2)], { type: 'application/json' })); a.download = 'events.json'; a.click(); };
-(async () => { await load(); render(); log(); })();
-
+async function openSession(id,navigate=true){const request=++detailRequest,epoch=authEpoch;let candidate=sessions.find(s=>s.id===id);const rows=[];
+  // A viewed older session may fall outside the latest-1,000 list after polling.
+  if(!candidate){const found=await A.rest('student_sessions?select='+safeColumns+'&id=eq.'+encodeURIComponent(id));candidate=found[0];}
+  if(request!==detailRequest||epoch!==authEpoch)return;
+  if(!candidate){selected=null;detailEvents=[];$('session-detail').hidden=true;return;}
+  for(let offset=0;;offset+=1000){const batch=await A.rest('monitoring_events?select=*&session_id=eq.'+id+'&order=occurred_at.asc,id.asc&limit=1000&offset='+offset);if(request!==detailRequest||epoch!==authEpoch)return;rows.push(...batch);if(batch.length<1000)break;}
+  selected=candidate;detailEvents=rows;
+  $('session-detail').hidden=false;$('detail-title').textContent=selected.student_name+' · '+selected.student_email;$('detail-info').textContent=title(selected.exam_id)+' | Started '+when(selected.started_at)+' | Ended '+when(selected.ended_at)+' | Session '+selected.id;$('detail-summary').textContent=detailEvents.length+' meaningful records · '+detailEvents.filter(e=>e.category==='REVIEW').length+' requiring review · '+status(selected.status)+' · Submission '+status(selected.submission_status);$('teacher-end').hidden=!['active','technical_issue','submitted'].includes(selected.status);$('timeline').innerHTML=detailEvents.map(e=>`<li><time>${esc(when(e.occurred_at))}</time><strong>${esc(e.description)}</strong><span>${esc(S.CATEGORIES[e.category])}</span><details><summary>Technical details</summary><pre>${esc(JSON.stringify(e.metadata,null,2))}</pre></details></li>`).join('')||'<li>No synchronized activity yet.</li>';if(navigate)location.hash='session-detail';}
+function exportRows(rows,name){const normalized=rows.map(e=>{const s=e.student_sessions||sessions.find(s=>s.id===e.session_id)||selected;return {...e,student:s?.student_name,email:s?.student_email,exam:title(s?.exam_id)};});const cols=['student','email','exam','session_id','event_type','description','category','occurred_at','duration_ms'];const cell=v=>{let t=String(v??'');if(/^\s*[=+@-]/.test(t))t="'"+t;return '"'+t.replaceAll('"','""')+'"';};U.download(name,[cols.join(','),...normalized.map(e=>cols.map(c=>cell(e[c])).join(','))].join('\r\n'),'text/csv;charset=utf-8');}
+$('detail-export').onclick=()=>{if(selected)exportRows(detailEvents,'formsentry-session-'+selected.id+'.csv');};$('export').onclick=()=>exportRows(visibleEvents(),'formsentry-activities.csv');$('detail-close').onclick=()=>{detailRequest++;selected=null;detailEvents=[];$('session-detail').hidden=true;};
+$('teacher-end').onclick=()=>{if(selected&&confirm('End this student session? The extension will stop on its next successful sync. Offline devices cannot be stopped immediately.'))U.action($('teacher-end'),$('detail-feedback'),async()=>{await A.rest('rpc/formsentry_teacher_end',{method:'POST',body:{p_session:selected.id}});await refresh();await openSession(selected.id);});};
+$('student-search').oninput=sessionRows;$('exam-filter').onchange=sessionRows;$('category-filter').onchange=eventRows;$('refresh').onclick=()=>U.action($('refresh'),$('feedback'),refresh);
+$('auth-mode').onchange=()=>{const mode=$('auth-mode').value;$('name-field').hidden=mode!=='register';$('auth-name').required=mode==='register';$('password-field').hidden=mode==='recover';$('auth-password').required=mode!=='recover';$('auth-password').minLength=mode==='register'?12:1;$('auth-password').autocomplete=mode==='register'?'new-password':'current-password';$('auth-submit').textContent={login:'Sign in',register:'Create account',recover:'Send recovery email'}[mode];};
+$('auth-form').onsubmit=e=>{e.preventDefault();U.action($('auth-submit'),$('auth-feedback'),async()=>{const email=$('auth-email').value.trim(),password=$('auth-password').value,mode=$('auth-mode').value;if(mode==='register'){await A.signup($('auth-name').value.trim(),email,password);$('auth-feedback').textContent='Check your email to verify your account, then return to sign in.';}else if(mode==='recover'){await A.recover(email);$('auth-feedback').textContent='If the account exists, a recovery email has been requested.';}else{await A.login(email,password);await unlock();}$('auth-password').value='';});};
+$('logout').onclick=()=>U.action($('logout'),$('feedback'),async()=>{try{await A.logout();}finally{lock();}});
+$('account-recovery').onclick=()=>U.action($('account-recovery'),$('feedback'),async()=>{await A.recover(account.email);$('feedback').textContent='Password recovery email requested.';});
+$('password-form').onsubmit=e=>{e.preventDefault();U.action($('password-submit'),$('password-feedback'),async()=>{await A.password($('new-password').value);$('new-password').value='';$('recovery').hidden=true;await unlock();});};
+setInterval(()=>{if(!document.hidden&&account)refresh();},20000);
+(async()=>{try{if(A.callback()){$('auth').hidden=true;$('recovery').hidden=false;return;}if(A.hasSession())await unlock();}catch(e){lock();feedback('auth-feedback',e);}})();

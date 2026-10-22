@@ -1,199 +1,274 @@
-// Service worker: session state, tab/window monitoring, domain rules, event log.
-const SEVERITY = {
-  WINDOW_BLUR:'LOW', WINDOW_FOCUS:'LOW', PAGE_HIDDEN:'LOW', PAGE_VISIBLE:'LOW', TAB_RETURN:'LOW',
-  FULLSCREEN_ENTER:'LOW', NETWORK_DISCONNECTED:'LOW', NETWORK_RECONNECTED:'LOW', EXAM_STARTED:'LOW', EXAM_ENDED:'LOW',
-  FULLSCREEN_EXIT:'MEDIUM', TAB_SWITCH:'MEDIUM', NEW_TAB_OPENED:'MEDIUM', COPY_ATTEMPT:'MEDIUM', CUT_ATTEMPT:'MEDIUM',
-  PASTE_ATTEMPT:'MEDIUM', CONTEXT_MENU_ATTEMPT:'LOW', KEYBOARD_RESTRICTION_ATTEMPT:'MEDIUM', PDF_OPENED:'MEDIUM',
-  EXTENSION_DISCONNECTED:'MEDIUM', EXAM_TAB_CLOSED:'MEDIUM', DESKTOP_APPLICATION_OPENED:'HIGH',
-  DEVTOOLS_ATTEMPT:'HIGH', AI_WEBSITE_DETECTED:'HIGH', BLOCKED_WEBSITE_DETECTED:'HIGH'
-};
-const WEIGHT = { TAB_SWITCH:1, FULLSCREEN_EXIT:1, COPY_ATTEMPT:1, CUT_ATTEMPT:1, PASTE_ATTEMPT:1, NEW_TAB_OPENED:1,
-  KEYBOARD_RESTRICTION_ATTEMPT:1, BLOCKED_WEBSITE_DETECTED:3, AI_WEBSITE_DETECTED:3, DEVTOOLS_ATTEMPT:3, PDF_OPENED:1 };
-
-const DEFAULT_RULES = { tabSwitch:'MONITOR', newTab:'BLOCK', ai:'BLOCK', copyPaste:'BLOCK',
-  fullscreen:'REQUIRED', devtools:'RESTRICT', contextMenu:'BLOCK' };
-const DEFAULT_DOMAINS = `chatgpt.com,AI
-chat.openai.com,AI
-claude.ai,AI
-gemini.google.com,AI
-copilot.microsoft.com,AI
-perplexity.ai,AI
-google.com,SEARCH,MONITORED
-bing.com,SEARCH,MONITORED
-duckduckgo.com,SEARCH,MONITORED
-messenger.com,COMM,BLOCKED
-discord.com,COMM,BLOCKED
-web.whatsapp.com,COMM,BLOCKED
-facebook.com,COMM,MONITORED`;
-
-let q = Promise.resolve();
-const serial = fn => (q = q.then(fn).catch(e => console.error(e)));
-
-const get = async k => (await chrome.storage.local.get(k))[k];
-const set = o => chrome.storage.local.set(o);
-const getConfig = async () => (await get('config')) || { exams: [], domains: DEFAULT_DOMAINS, endpoint: '' };
-
-function formId(url) {
-  const m = /\/forms\/d\/(?:e\/)?([^/?#]+)/.exec(url || '');
-  return m ? m[1] : null;
-}
-function findExam(cfg, url) {
-  const id = formId(url);
-  return id ? cfg.exams.find(e => formId(e.url) === id) : null;
-}
-function hostOf(url) { try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; } }
-function classify(cfg, host) {
-  for (const line of cfg.domains.split('\n')) {
-    const [d, cat, rule] = line.split(',').map(s => (s || '').trim());
-    if (!d) continue;
-    const hit = host === d || (d !== 'google.com' && host.endsWith('.' + d));
-    if (hit) return { domain: d, category: cat || 'OTHER', rule: rule || 'MONITORED' };
+/* FormSentry MV3 worker: the only writer of configuration, sessions and activity. */
+importScripts('shared.js', 'event-processor.js', 'cloud-config.js', 'cloud-client.js', 'cloud-sync.js');
+const S = FormSentry, P = FormSentryProcessor;
+let queue = Promise.resolve();
+function serial(fn) { const task = queue.then(fn); queue = task.catch(() => {}); return task; }
+async function save(db) {
+  FormSentrySync.stage(db);
+  const openId = db.session?.processor?.episode?.id;
+  const openEvent = (db.events || []).find(e => e.id === openId);
+  db.events = (db.events || []).slice(-3000);
+  // An unfinalized departure must survive the display-history limit.
+  if (openEvent && !db.events.some(e => e.id === openId)) db.events.unshift(openEvent);
+  db.testEvents = (db.testEvents || []).slice(-500);
+  if (db.session) {
+    const { processor, documentId, previousDocuments, cloud, ...summary } = db.session;
+    db.sessions = [...(db.sessions || []).filter(s => s.id !== summary.id), summary].slice(-100);
   }
-  return null;
+  await chrome.storage.local.set(db);
 }
-// In DETECTION mode every BLOCK/RESTRICT is downgraded to monitoring only.
-const eff = (exam, key) => {
-  const v = exam.rules[key];
-  return exam.mode === 'DETECTION' && (v === 'BLOCK' || v === 'RESTRICT') ? 'MONITOR' : v;
-};
-
-async function logEvent(type, { domain = '', metadata = {}, simulated = false } = {}) {
-  const s = await get('session');
-  if (!simulated && !(s && s.active)) return null;
-  const ev = {
-    id: 'evt_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-    type, timestamp: new Date().toISOString(), examUrl: s ? s.examUrl : '', domain,
-    severity: SEVERITY[type] || 'LOW', sessionId: s ? s.id : null,
-    metadata: simulated ? { ...metadata, SIMULATED_EVENT: true } : metadata
-  };
-  const events = ((await get('events')) || []).concat(ev).slice(-3000);
-  await set({ events });
-  const cfg = await getConfig();
-  if (cfg.endpoint) fetch(cfg.endpoint, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(ev) }).catch(() => {});
-  if (s && s.tabId != null) chrome.tabs.sendMessage(s.tabId, { kind: 'EVENT', event: ev, count: events.filter(e => e.sessionId === s.id).length }).catch(() => {});
-  chrome.action.setBadgeText({ text: s && s.active ? String(events.filter(e => e.sessionId === s.id).length) : '' });
-  return ev;
-}
-
-async function startSession(exam, tabId) {
-  const s = { id: 's_' + Date.now().toString(36), active: true, examId: exam.id, examUrl: exam.url, tabId, awayStart: null, startedAt: Date.now() };
-  await set({ session: s });
-  await set({ hb: Date.now() });
-  await logEvent('EXAM_STARTED', { metadata: { exam: exam.name } });
-}
-async function endSession(reason) {
-  const s = await get('session');
-  if (!s || !s.active) return;
-  await logEvent('EXAM_ENDED', { metadata: { reason } });
-  s.active = false; // STOP ALL MONITORING
-  await set({ session: s });
-  chrome.action.setBadgeText({ text: '' });
-}
-
-async function handleActive(tab) {
-  const s = await get('session');
-  if (!s || !s.active || !tab) return;
-  const cfg = await getConfig();
-  const exam = cfg.exams.find(e => e.id === s.examId);
-  if (!exam) return;
-  if (tab.id === s.tabId) {
-    if (s.awayStart) {
-      const dur = Math.round((Date.now() - s.awayStart) / 1000);
-      s.awayStart = null; await set({ session: s });
-      await logEvent('TAB_RETURN', { metadata: { durationSeconds: dur } });
+async function load() {
+  const db = await chrome.storage.local.get(['config', 'session', 'sessions', 'events', 'testEvents', 'schemaVersion', 'outbox', 'invitations', 'pendingAttempt']);
+  db.config = S.normalizeConfig(db.config); db.events ||= []; db.sessions ||= []; db.testEvents ||= [];
+  if (db.schemaVersion !== 2) {
+    const real = [];
+    for (const e of db.events) {
+      if (e.metadata?.SIMULATED_EVENT) db.testEvents.push({ ...e, simulated: true, sessionId: null });
+      else real.push({ ...e, category: e.category || 'LEGACY', legacy: !e.category });
     }
-  } else if (!s.awayStart && exam.rules.tabSwitch !== 'OFF') {
-    s.awayStart = Date.now(); await set({ session: s });
-    await logEvent('TAB_SWITCH', { domain: hostOf(tab.url || tab.pendingUrl) });
-    if (eff(exam, 'tabSwitch') === 'BLOCK') focusExam(s);
+    db.events = real;
+    if (db.session?.active && !db.session.exam) {
+      Object.assign(db.session, { active: false, status: 'INTERRUPTED', endedAt: Date.now(), endReason: 'Extension upgraded; start a new session.' });
+      db.events.push({ id: `${db.session.id}:upgrade`, sessionId: db.session.id, timestamp: new Date().toISOString(), type: 'SESSION_INTERRUPTED', category: 'SYSTEM', severity: 'MEDIUM', metadata: { reason: db.session.endReason } });
+    }
+    db.schemaVersion = 2; await save(db);
+  }
+  return db;
+}
+const event = (db, type, fields = {}) => P.process(db.session, db.events, { type, at: Date.now(), ...fields });
+async function publish(db) {
+  const s = db.session;
+  await chrome.action.setBadgeText({ text: s?.active ? 'ON' : '' });
+  await chrome.action.setBadgeBackgroundColor({ color: '#285bb5' });
+  if (s?.tabId != null) {
+    try { await chrome.tabs.sendMessage(s.tabId, { kind: 'SESSION_STATE', sessionId: s.id, active: s.active, status: s.status }, { frameId: 0 }); }
+    catch { /* Navigating/closed pages rehydrate state through HELLO. */ }
   }
 }
-function focusExam(s) {
-  chrome.tabs.update(s.tabId, { active: true }).then(t => chrome.windows.update(t.windowId, { focused: true })).catch(() => {});
+async function finish(db, reason, interrupted = false) {
+  if (!db.session?.active) return;
+  const s = db.session, episode = s.processor?.episode;
+  if (episode) {
+    const departure = db.events.find(e => e.id === episode.id);
+    if (departure) { departure.metadata.durationMs = Math.max(0, Date.now() - episode.at); departure.metadata.endedWhileAway = true; }
+    s.processor.episode = null;
+  }
+  if (s.cloud && !s.cloud.final) s.cloud.final = interrupted ? 'interrupted' : 'submission_unverified';
+  event(db, interrupted ? 'SESSION_INTERRUPTED' : 'EXAM_ENDED', { metadata: { reason } });
+  Object.assign(db.session, { active: false, status: interrupted ? 'INTERRUPTED' : s.cloud?.final === 'technical_issue' ? 'TECHNICAL_ISSUE' : s.cloud?.final === 'submission_unverified' ? 'SUBMISSION_UNVERIFIED' : 'COMPLETED', endedAt: Date.now(), endReason: reason });
+  await save(db); await publish(db);
 }
-
-async function checkUrl(tab) {
-  const s = await get('session');
-  if (!s || !s.active || tab.id === s.tabId || !tab.url) return;
-  const cfg = await getConfig();
-  const exam = cfg.exams.find(e => e.id === s.examId);
-  if (!exam) return;
-  if (/\.pdf($|[?#])/i.test(tab.url)) await logEvent('PDF_OPENED', { domain: hostOf(tab.url), metadata: { url: tab.url } });
-  const host = hostOf(tab.url);
-  const c = classify(cfg, host);
-  if (!c || c.rule === 'ALLOWED') return;
-  const isAI = c.category === 'AI';
-  const rule = isAI ? eff(exam, 'ai') : (c.rule === 'BLOCKED' ? eff({ mode: exam.mode, rules: { x: 'BLOCK' } }, 'x') : 'MONITOR');
-  if (isAI && rule === 'ALLOW') return;
-  await logEvent(isAI ? 'AI_WEBSITE_DETECTED' : 'BLOCKED_WEBSITE_DETECTED', { domain: host, metadata: { category: c.category, action: rule } });
-  if (rule === 'BLOCK') chrome.tabs.update(tab.id, { url: chrome.runtime.getURL('blocked.html') + '?d=' + encodeURIComponent(host) });
+function ui(sender, pages) {
+  if (sender.id !== chrome.runtime.id) return false;
+  try { return pages.some(path => new URL(sender.url).href.split(/[?#]/)[0] === chrome.runtime.getURL(path)); } catch { return false; }
 }
-
-chrome.tabs.onActivated.addListener(({ tabId }) => serial(async () => handleActive(await chrome.tabs.get(tabId))));
-chrome.windows.onFocusChanged.addListener(w => serial(async () => {
-  if (w === chrome.windows.WINDOW_ID_NONE) return; // browser lost focus: content script reports blur
-  const [t] = await chrome.tabs.query({ active: true, windowId: w });
-  await handleActive(t);
-}));
-chrome.tabs.onCreated.addListener(tab => serial(async () => {
-  const s = await get('session');
-  if (!s || !s.active) return;
-  const cfg = await getConfig();
-  const exam = cfg.exams.find(e => e.id === s.examId);
-  if (!exam || exam.rules.newTab === 'ALLOW') return;
-  await logEvent('NEW_TAB_OPENED');
-  if (eff(exam, 'newTab') === 'BLOCK') { chrome.tabs.remove(tab.id).catch(() => {}); focusExam(s); }
-}));
-chrome.tabs.onUpdated.addListener((id, info, tab) => { if (info.url || info.status === 'complete') serial(() => checkUrl(tab)); });
-chrome.tabs.onRemoved.addListener(id => serial(async () => {
-  const s = await get('session');
-  if (s && s.active && s.tabId === id) await logEvent('EXAM_TAB_CLOSED', { metadata: { note: 'Reopening the approved form resumes monitoring.' } });
-}));
-
-// Heartbeat: a long gap means the extension/browser was disabled or closed mid-exam.
-chrome.alarms.create('hb', { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener(() => serial(async () => {
-  const s = await get('session'); if (s && s.active) await set({ hb: Date.now() });
-}));
-async function checkGap() {
-  const s = await get('session'), hb = await get('hb');
-  if (s && s.active && hb && Date.now() - hb > 90000)
-    await logEvent('EXTENSION_DISCONNECTED', { metadata: { gapSeconds: Math.round((Date.now() - hb) / 1000), note: 'Not proof of cheating.' } });
-  if (s && s.active) await set({ hb: Date.now() });
+function bound(sender, s, document = true) {
+  return !!s && sender.id === chrome.runtime.id && sender.frameId === 0 && sender.tab?.id === s.tabId &&
+    S.formInfo(sender.url)?.id === S.formInfo(s.examUrl)?.id && (!document || sender.documentId === s.documentId);
 }
-chrome.runtime.onStartup.addListener(() => serial(checkGap));
-chrome.runtime.onInstalled.addListener(() => serial(checkGap));
-
-const SIM = {
-  TAB_SWITCH: {}, AI_WEBSITE_DETECTED: { domain: 'chatgpt.com' }, BLOCKED_WEBSITE_DETECTED: { domain: 'discord.com' },
-  FULLSCREEN_EXIT: {}, COPY_ATTEMPT: {}, PASTE_ATTEMPT: {}, DEVTOOLS_ATTEMPT: {}, EXTENSION_DISCONNECTED: {},
-  PDF_OPENED: {}, DESKTOP_APPLICATION_OPENED: { metadata: { application: 'Microsoft Word', requires: 'optional desktop monitoring client' } }
-};
-
+async function focusExam(db) {
+  if (!db.session?.active) throw new Error('There is no active exam.');
+  const tab = await chrome.tabs.update(db.session.tabId, { active: true });
+  await chrome.windows.update(tab.windowId, { focused: true });
+}
+async function enforce(db, operation) {
+  try { await operation(); }
+  catch { event(db, 'MONITOR_ERROR', { metadata: { reason: 'A browser restriction could not be applied. The tab may have closed.' } }); }
+}
+async function checkUrl(db, tab, value) {
+  const s = db.session;
+  if (!s?.active || tab.windowId !== s.windowId || tab.id === s.tabId || tab.active === false || !value) return;
+  let u; try { u = new URL(value); } catch { return; }
+  if (!['https:', 'http:'].includes(u.protocol)) { delete s.processor.navigation[tab.id]; return; }
+  // Query/hash changes and repeated loading notifications are the same website visit.
+  // Store a digest for correlation, never the path/query, in the session state.
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(u.origin + u.pathname));
+  const fingerprint = Array.from(new Uint8Array(digest), x => x.toString(16).padStart(2, '0')).join('');
+  const nav = s.processor.navigation;
+  if (nav[tab.id] === fingerprint) return;
+  nav[tab.id] = fingerprint;
+  const keys = Object.keys(nav); if (keys.length > 300) delete nav[keys[0]];
+  const host = u.hostname.toLowerCase().replace(/^www\./, ''), rule = S.classifyDomain(s.domainRules, host);
+  if (rule && rule.action !== 'ALLOWED') {
+    const ai = rule.category === 'AI', setting = ai ? s.exam.rules.ai : rule.action === 'BLOCKED' ? 'BLOCK' : 'MONITOR';
+    if (setting !== 'ALLOW') {
+      const disallowed = setting === 'BLOCK', blocked = disallowed && s.exam.mode === 'RESTRICTION';
+      event(db, ai ? 'AI_WEBSITE_DETECTED' : 'DOMAIN_VISIT', { domain: host,
+        metadata: { domainCategory: rule.category, disallowed, action: blocked ? 'BLOCK' : 'MONITOR', pdf: /\.pdf$/i.test(u.pathname) } });
+      if (s.exam.warningMode) {
+        try { await chrome.tabs.sendMessage(s.tabId, { kind: 'NOTICE', sessionId: s.id, message: 'A restricted-domain visit was recorded. Please return to the examination.' }, { frameId: 0 }); } catch { /* Exam may be navigating. */ }
+      }
+      if (blocked) await enforce(db, () => chrome.tabs.update(tab.id, { url: chrome.runtime.getURL('blocked.html') + '?d=' + encodeURIComponent(host) }));
+    }
+  }
+}
+async function handle(m, sender) {
+  const db = await load(), s = db.session, cfg = db.config;
+  const admin = ui(sender, ['options.html']), popup = ui(sender, ['popup.html']);
+  if (m.kind === 'SUMMARY') {
+    if (!admin && !popup) throw new Error('This page cannot read monitoring records.');
+    const safeSession = s ? { ...s, cloud: s.cloud ? { syncError: s.cloud.syncError, lastSyncAt: s.cloud.lastSyncAt, submission: s.cloud.submission } : undefined } : null;
+    const currentEvents = [...new Map([
+      ...(db.outbox?.[s?.id]?.events || []),
+      ...db.events.filter(e => e.sessionId === s?.id)
+    ].map(e => [e.id, e])).values()].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    return { ok: true, session: safeSession, events: currentEvents, metrics: S.metrics(currentEvents), activeSessions: s?.active ? 1 : 0 };
+  }
+  if (m.kind === 'HELLO' || m.kind === 'GET_STATE') {
+    if (sender.id !== chrome.runtime.id || sender.frameId !== 0 || !S.formInfo(sender.url)) throw new Error('Not a supported Google Form.');
+    let exam;
+    if (s?.active && bound(sender, s, false)) {
+      const tab = await chrome.tabs.get(sender.tab.id);
+      if (S.formInfo(tab.url)?.id !== S.formInfo(s.examUrl)?.id) throw new Error('The exam tab has navigated away.');
+      if (S.formInfo(sender.url)?.page === 'formResponse') {
+        if (s.cloud) { s.cloud.submission = 'detected'; s.cloud.final = 'submission_unverified'; }
+        event(db, 'SUBMISSION_DETECTED');
+        await finish(db, 'Google Forms submission route observed (response acceptance is not verified).');
+        return { ok: true, exam: s.exam, active: false, status: s.status, sessionId: s.id };
+      }
+      if (s.documentId !== sender.documentId) {
+        if (s.previousDocuments?.includes(sender.documentId)) throw new Error('This document is no longer active.');
+        s.previousDocuments = [...(s.previousDocuments || []), s.documentId].slice(-30);
+        s.documentId = sender.documentId;
+        event(db, 'EXAM_RECONNECTED', { metadata: { reason: 'Exam document loaded again; the existing session continues.' } });
+      }
+      s.lastContactAt = Date.now(); await save(db);
+      return { ok: true, exam: s.exam, active: true, status: 'MONITORING', sessionId: s.id };
+    }
+    db.invitations ||= {};
+    const previous = db.invitations[sender.tab.id], code = m.joinCode || previous?.joinCode;
+    if (code) {
+      if (!/^[a-f0-9]{48}$/.test(code)) throw new Error('Invalid invitation. Ask your teacher for the examination link.');
+      const result = await FormSentryCloud.student({ action: 'resolve', joinCode: code });
+      exam = FormSentryCloud.localExam(result.exam);
+      if (S.formInfo(exam.url)?.id !== S.formInfo(sender.url)?.id) throw new Error('This invitation belongs to a different Google Form.');
+      db.invitations[sender.tab.id] = { joinCode: code, exam }; await save(db);
+    }
+    return { ok: true, exam: exam || null, active: false, status: s && bound(sender, s, false) ? s.status : exam ? 'READY' : 'NOT_STARTED', sessionId: null, busy: !!s?.active };
+  }
+  if (m.kind === 'START') {
+    if (sender.id !== chrome.runtime.id || sender.frameId !== 0 || !sender.tab || !sender.documentId) throw new Error('Start monitoring from the approved Google Form.');
+    if (s?.active) {
+      if (bound(sender, s)) return { ok: true, sessionId: s.id, exam: s.exam };
+      throw new Error('Another exam session is active. End it before starting a new one.');
+    }
+    const invitation = db.invitations?.[sender.tab.id];
+    if (!invitation || S.formInfo(sender.url)?.page !== 'viewform') throw new Error('Open the examination invitation link from your teacher first.');
+    const name = String(m.name || '').trim(), email = String(m.email || '').trim().toLowerCase();
+    if (name.length < 2 || name.length > 120 || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || m.consent !== true) throw new Error('Enter your full name and email and agree to monitoring before starting.');
+    const resolved = await FormSentryCloud.student({ action: 'resolve', joinCode: invitation.joinCode });
+    const exam = FormSentryCloud.localExam(resolved.exam);
+    let validated = { ...S.validateExam(exam), warningMode: exam.warningMode, cloudRules: exam.cloudRules };
+    let domainRules = exam.cloudRules.domains.map(domain => ({ domain, category: 'RESTRICTED', action: 'MONITORED' }));
+    const tab = await chrome.tabs.get(sender.tab.id);
+    if (S.formInfo(tab.url)?.id !== S.formInfo(exam.url).id) throw new Error('The tab has moved away from the approved form.');
+    if (!db.pendingAttempt || db.pendingAttempt.joinCode !== invitation.joinCode || db.pendingAttempt.name !== name || db.pendingAttempt.email !== email) {
+      db.pendingAttempt = { joinCode: invitation.joinCode, name, email, token: [...crypto.getRandomValues(new Uint8Array(32))].map(b => b.toString(16).padStart(2,'0')).join('') };
+      await save(db);
+    }
+    const attempt = db.pendingAttempt;
+    const remote = await FormSentryCloud.student({ action: 'start', ...attempt, consent: true });
+    if (remote.session.status !== 'active') throw new Error('This attempt has ended. Ask the teacher before starting another attempt.');
+    if (remote.session.rules) {
+      const snapshot = FormSentryCloud.localExam({ ...resolved.exam, rules: remote.session.rules });
+      validated = { ...S.validateExam(snapshot), warningMode: snapshot.warningMode, cloudRules: snapshot.cloudRules };
+      domainRules = snapshot.cloudRules.domains.map(domain => ({ domain, category: 'RESTRICTED', action: 'MONITORED' }));
+    }
+    db.session = { id: remote.session.id, active: true, status: 'MONITORING', exam: validated, examId: exam.id, examUrl: validated.url,
+      student: { name, email, verified: false }, consentAt: Date.now(), cloud: { token: attempt.token, submission: 'not_detected' },
+      tabId: tab.id, windowId: tab.windowId, documentId: sender.documentId, startedAt: Date.now(), lastContactAt: Date.now(),
+      correlationMs: cfg.correlationMs, domainRules, processor: P.state() };
+    db.pendingAttempt = null;
+    db.session.processor.fullscreen = !!m.fullscreen; db.session.processor.online = m.online !== false;
+    event(db, 'EXAM_STARTED', { metadata: { mode: exam.mode, rules: validated.rules } });
+    await save(db); await publish(db);
+    return { ok: true, sessionId: db.session.id, exam: validated };
+  }
+  if (m.kind === 'END') {
+    if (!popup && !admin && !(s?.active && bound(sender, s) && m.sessionId === s.id)) throw new Error('Only the monitored exam or FormSentry controls can end this session.');
+    if (s?.cloud) { s.cloud.final = m.technical ? 'technical_issue' : 'completed'; s.cloud.submission = 'unverified'; }
+    await finish(db, m.technical ? 'Student stopped for a technical issue or withdrawal of consent.' : 'Monitoring ended explicitly; submission remains unverified.'); return { ok: true, status: db.session?.status };
+  }
+  if (m.kind === 'PING') {
+    if (!s?.active || !bound(sender, s) || m.sessionId !== s.id) return { ok: true, active: false, status: s?.status || 'NOT_STARTED' };
+    s.lastContactAt = Date.now(); await save(db); await FormSentrySync.flush(db, FormSentryCloud); await save(db); await publish(db); return { ok: true, active: s.active, status: s.status, syncError: s.cloud?.syncError };
+  }
+  if (m.kind === 'EVENT') {
+    if (!s?.active || !bound(sender, s) || m.sessionId !== s.id) return { ok: true, active: false, status: s?.status || 'NOT_STARTED', recorded: false };
+    const allowed = ['WINDOW_BLUR', 'WINDOW_FOCUS', 'PAGE_HIDDEN', 'PAGE_VISIBLE', 'FULLSCREEN_ENTER', 'FULLSCREEN_EXIT', 'NETWORK_DISCONNECTED', 'NETWORK_RECONNECTED', 'COPY_ATTEMPT', 'CUT_ATTEMPT', 'PASTE_ATTEMPT', 'CONTEXT_MENU_ATTEMPT', 'DEVTOOLS_SHORTCUT', 'KEYBOARD_SHORTCUT'];
+    if (!allowed.includes(m.type) || typeof m.id !== 'string' || m.id.length > 160) throw new Error('Invalid activity message.');
+    const now = Date.now(), at = Number.isFinite(m.at) ? Math.min(now, Math.max(s.startedAt, m.at)) : now;
+    const record = event(db, m.type, { id: sender.documentId + ':' + m.id, at, sessionId: m.sessionId });
+    s.lastContactAt = now; await save(db); return { ok: true, active: true, recorded: !!record };
+  }
+  if (m.kind === 'RETURN_TO_EXAM') {
+    if (!admin && !popup && !ui(sender, ['blocked.html'])) throw new Error('Unavailable from this page.');
+    await focusExam(db); return { ok: true };
+  }
+  throw new Error('Examination management requires the authenticated Supabase teacher dashboard.');
+}
 chrome.runtime.onMessage.addListener((m, sender, reply) => {
-  serial(async () => {
-    const cfg = await getConfig();
-    if (m.kind === 'GET_STATE') {
-      const exam = findExam(cfg, m.url);
-      const s = await get('session');
-      const active = !!(exam && s && s.active && s.examId === exam.id);
-      if (active && sender.tab) { s.tabId = sender.tab.id; await set({ session: s }); }
-      const events = (await get('events')) || [];
-      return reply({ exam, active, count: active ? events.filter(e => e.sessionId === s.id).length : 0 });
-    }
-    if (m.kind === 'START') { const exam = findExam(cfg, m.url); if (exam) await startSession(exam, sender.tab.id); return reply({ ok: !!exam }); }
-    if (m.kind === 'END') { await endSession(m.reason || 'ended'); return reply({ ok: true }); }
-    if (m.kind === 'EVENT') { const s = await get('session'); if (s && s.active) await logEvent(m.type, { domain: m.domain, metadata: m.metadata }); return reply({ ok: true }); }
-    if (m.kind === 'SIMULATE') { const d = SIM[m.type] || {}; await logEvent(m.type, { ...d, simulated: true }); return reply({ ok: true }); }
-    if (m.kind === 'RETURN_TO_EXAM') { const s = await get('session'); if (s) focusExam(s); return reply({ ok: true }); }
-    if (m.kind === 'SUMMARY') {
-      const s = await get('session'), events = (await get('events')) || [];
-      const mine = s ? events.filter(e => e.sessionId === s.id) : [];
-      const real = mine.filter(e => !e.metadata.SIMULATED_EVENT);
-      return reply({ session: s, cfg, monitoring: mine.length,
-        violations: real.filter(e => WEIGHT[e.type]).length, score: real.reduce((a, e) => a + (WEIGHT[e.type] || 0), 0) });
-    }
-    reply({});
-  });
+  serial(() => handle(m || {}, sender)).then(reply, error => reply({ ok: false, error: error.message || 'FormSentry could not complete this operation.' }));
   return true;
 });
+function listen(emitter, fn) {
+  emitter.addListener((...args) => {
+    const at = Date.now();
+    serial(async () => { const db = await load(); if (!db.session?.active) return; await fn(db, at, ...args); await save(db); })
+      .catch(() => chrome.action.setBadgeText({ text: '!' }).catch(() => {}));
+  });
+}
+listen(chrome.tabs.onActivated, async (db, at, { tabId, windowId }) => {
+  const s = db.session; if (windowId !== s.windowId) return;
+  event(db, tabId === s.tabId ? 'TAB_RETURN' : 'TAB_SWITCH', { at, metadata: { tabId } });
+  if (tabId !== s.tabId) {
+    try { const tab = await chrome.tabs.get(tabId); await checkUrl(db, tab, tab.url); } catch { /* Tab closed before inspection. */ }
+    if (S.blocks(s.exam, 'tabSwitch')) await enforce(db, () => focusExam(db));
+  }
+});
+listen(chrome.windows.onFocusChanged, async (db, at, windowId) => event(db, windowId === db.session.windowId ? 'BROWSER_FOCUS' : 'BROWSER_BLUR', { at }));
+listen(chrome.tabs.onCreated, async (db, at, tab) => {
+  const s = db.session; if (tab.windowId !== s.windowId) return;
+  event(db, 'NEW_TAB_OPENED', { at, metadata: { tabId: tab.id } });
+  if (S.blocks(s.exam, 'newTab')) { await enforce(db, () => chrome.tabs.remove(tab.id)); await enforce(db, () => focusExam(db)); }
+  else await checkUrl(db, tab, tab.pendingUrl || tab.url);
+});
+listen(chrome.tabs.onUpdated, async (db, at, id, info, tab) => {
+  if (!info.url) return;
+  const s = db.session;
+  if (id === s.tabId) {
+    const f = S.formInfo(info.url);
+    if (!f || f.id !== S.formInfo(s.examUrl)?.id) await finish(db, 'Exam tab navigated away from the approved form.', true);
+    else if (f.page === 'formResponse') {
+      if (s.cloud) { s.cloud.submission = 'detected'; s.cloud.final = 'submission_unverified'; }
+      event(db, 'SUBMISSION_DETECTED'); await finish(db, 'Google Forms submission route observed (response acceptance is not verified).');
+    }
+  } else await checkUrl(db, tab, info.url);
+});
+listen(chrome.tabs.onRemoved, async (db, at, id) => {
+  if (id === db.session.tabId) await finish(db, 'Exam tab closed.', true); else delete db.session.processor.navigation[id];
+});
+listen(chrome.tabs.onAttached, async (db, at, id, info) => {
+  if (id === db.session.tabId && info.newWindowId !== db.session.windowId) await finish(db, 'Exam tab moved to another Chrome window; start a new session there.', true);
+});
+listen(chrome.tabs.onReplaced, async (db, at, added, removed) => {
+  if (removed === db.session.tabId) await finish(db, 'Chrome replaced the monitored tab; start a new session.', true);
+});
+async function reconcile(reason) {
+  const db = await load(), s = db.session;
+  await FormSentrySync.flush(db, FormSentryCloud); await save(db);
+  if (!s?.active) { await publish(db); return; }
+  if (reason) { await finish(db, reason, true); return; }
+  try {
+    const tab = await chrome.tabs.get(s.tabId);
+    if (S.formInfo(tab.url)?.id !== S.formInfo(s.examUrl)?.id) await finish(db, 'The approved exam tab is no longer available.', true);
+  } catch { await finish(db, 'The exam tab could not be recovered.', true); }
+  // Worker sleep/device sleep is never interpreted as evidence of disabling the extension.
+}
+chrome.runtime.onStartup.addListener(() => serial(() => reconcile('Browser restarted during monitoring; start a new session.')).catch(() => {}));
+chrome.runtime.onInstalled.addListener(() => serial(() => reconcile('Extension installed or reloaded during monitoring; refresh the exam to start again.')).catch(() => {}));
+chrome.alarms.onAlarm.addListener(a => { if (a.name === 'formsentry-reconcile') serial(() => reconcile()).catch(() => {}); });
+serial(async () => {
+  await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
+  await chrome.alarms.create('formsentry-reconcile', { periodInMinutes: 1 }); await reconcile();
+}).catch(() => chrome.action.setBadgeText({ text: '!' }).catch(() => {}));

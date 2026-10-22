@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+.qa/
+*.log
+.env
+.env.*
+!.env.example
+formsentry-activities-*.json
+formsentry-activities-*.csv
+formsentry-TEST-*.json
+formsentry-TEST-*.csv

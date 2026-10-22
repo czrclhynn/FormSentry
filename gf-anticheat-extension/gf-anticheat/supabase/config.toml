@@ -1,0 +1,6 @@
+project_id = "formsentry"
+
+[functions.student-api]
+verify_jwt = false
+# Public exam resolution/start use a high-entropy invitation. Ingestion requires a
+# separate, unguessable session bearer token checked inside the function/database.

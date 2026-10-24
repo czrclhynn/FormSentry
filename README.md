@@ -185,7 +185,7 @@ The UI reports **Monitoring Events** (all events) and **Potential Violations** (
 ## Project structure
 
 ```
-gf-anticheat/
+./
 ├── manifest.json     Manifest V3 configuration
 ├── background.js     Service worker: sessions, tab/window monitoring, domain rules, event log
 ├── content.js        Google Forms page: overlay, fullscreen, clipboard, shortcuts, focus
@@ -236,4 +236,3 @@ Also check for false positives: accidental clicks outside the browser, brief net
 ## Disclaimer
 
 This tool reports detected browser activity for a teacher to review. A logged event is not proof of misconduct, and the tool does not guarantee academic integrity. Use it as one signal among several, with clear disclosure to students.
-
